@@ -193,12 +193,12 @@ def elman_backprop_5_5_5():
 
 
 if __name__ == '__main__':
-    feed_forward_backprop_10()
-    feed_forward_backprop_20()
+    #feed_forward_backprop_10()
+    #feed_forward_backprop_20()
 
     cascade_forward_backprop_20()
-    cascade_forward_backprop_10_10()
+    #cascade_forward_backprop_10_10()
 
-    elman_backprop_15()
-    elman_backprop_5_5_5()
+    #elman_backprop_15()
+    #elman_backprop_5_5_5()
 
