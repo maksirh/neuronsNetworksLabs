@@ -4,107 +4,172 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 import matplotlib.pyplot as plt
+from IPython import display
+from jiwer import wer
+
 import os
 
-wavs_path = "/kaggle/input/the-lj-speech-dataset/LJSpeech-1.1/wavs/"
-metadata_path = "/kaggle/input/the-lj-speech-dataset/LJSpeech-1.1/metadata.csv"
+data_path = "/kaggle/input/the-lj-speech-dataset/LJSpeech-1.1"
 
-metadata_df = pd.read_csv(metadata_path, sep='|', header=None, quoting=3)
+wavs_path = os.path.join(data_path, "wavs")
+metadata_path = os.path.join(data_path, "metadata.csv")
+
+if os.path.exists(data_path):
+    print("Папку знайдено! Вміст:", os.listdir(data_path))
+else:
+    print("Папку LJSpeech-1.1 не знайдено, перевіряємо корінь...")
+    data_path = "/kaggle/input/the-lj-speech-dataset"
+    wavs_path = os.path.join(data_path, "wavs")
+    metadata_path = os.path.join(data_path, "metadata.csv")
+    print("Вміст:", os.listdir(data_path))
+
+
+metadata_df = pd.read_csv(metadata_path, sep="|", header=None, quoting=3)
 metadata_df.columns = ["file_name", "transcription", "normalized_transcription"]
 metadata_df = metadata_df[["file_name", "normalized_transcription"]]
 metadata_df = metadata_df.sample(frac=1).reset_index(drop=True)
 
-fft_length = 384
-frame_length = 256
-frame_step = 160
+print(metadata_df.head(3))
 
 
-def encode_single_sample(wav_file, label):
-    file = tf.io.read_file(wavs_path + wav_file + ".wav")
-    audio, _ = tf.audio.decode_wav(file)
-    audio = tf.squeeze(audio, axis=-1)
-
-    spectrogram = tf.signal.stft(
-        audio, frame_length=frame_length, frame_step=frame_step, fft_length=fft_length
-    )
-    spectrogram = tf.abs(spectrogram)
-    spectrogram = tf.math.pow(spectrogram, 0.5)
-
-    means = tf.math.reduce_mean(spectrogram, 1, keepdims=True)
-    stddevs = tf.math.reduce_std(spectrogram, 1, keepdims=True)
-    spectrogram = (spectrogram - means) / (stddevs + 1e-10)
-
-    label = tf.strings.lower(label)
-    label = tf.strings.unicode_split(label, input_encoding="UTF-8")
-    label = char_to_num(label)
-    return spectrogram, label
-
-
-from tensorflow.keras import layers
-
+# The set of characters accepted in the transcription.
 characters = [x for x in "abcdefghijklmnopqrstuvwxyz'?! "]
-
-char_to_num = layers.StringLookup(vocabulary=characters, oov_token="")
-
-num_to_char = layers.StringLookup(
+# Mapping characters to integers
+char_to_num = keras.layers.StringLookup(vocabulary=characters, oov_token="")
+# Mapping integers back to original characters
+num_to_char = keras.layers.StringLookup(
     vocabulary=char_to_num.get_vocabulary(), oov_token="", invert=True
 )
 
-print(f"Розмір словника: {char_to_num.vocabulary_size()} символів")
-
-metadata_df = metadata_df.iloc[:4500]
-
-split = int(len(metadata_df) * 0.90)
-df_train = metadata_df[:split]
-df_val = metadata_df[split:]
-
-print(f"Train samples: {len(df_train)}")
-print(f"Val samples: {len(df_val)}")
-
-batch_size = 32
+print(
+    f"The vocabulary is: {char_to_num.get_vocabulary()} "
+    f"(size ={char_to_num.vocabulary_size()})"
+)
 
 
-def create_dataset(df):
-    dataset = tf.data.Dataset.from_tensor_slices(
-        (df["file_name"], df["normalized_transcription"])
+# An integer scalar Tensor. The window length in samples.
+frame_length = 256
+# An integer scalar Tensor. The number of samples to step.
+frame_step = 160
+# An integer scalar Tensor. The size of the FFT to apply.
+# If not provided, uses the smallest power of 2 enclosing frame_length.
+fft_length = 384
+
+
+def encode_single_sample(wav_file, label):
+    ###########################################
+    ##  Process the Audio
+    ##########################################
+    # 1. Read wav file
+    file = tf.io.read_file(wavs_path + "/" + wav_file + ".wav")
+    # 2. Decode the wav file
+    audio, _ = tf.audio.decode_wav(file)
+    audio = tf.squeeze(audio, axis=-1)
+    # 3. Change type to float
+    audio = tf.cast(audio, tf.float32)
+    # 4. Get the spectrogram
+    spectrogram = tf.signal.stft(
+        audio, frame_length=frame_length, frame_step=frame_step, fft_length=fft_length
     )
-    dataset = dataset.map(encode_single_sample, num_parallel_calls=tf.data.AUTOTUNE)
-    dataset = dataset.padded_batch(batch_size)
-    dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
-    return dataset
+    # 5. We only need the magnitude, which can be derived by applying tf.abs
+    spectrogram = tf.abs(spectrogram)
+    spectrogram = tf.math.pow(spectrogram, 0.5)
+    # 6. normalisation
+    means = tf.math.reduce_mean(spectrogram, 1, keepdims=True)
+    stddevs = tf.math.reduce_std(spectrogram, 1, keepdims=True)
+    spectrogram = (spectrogram - means) / (stddevs + 1e-10)
+    ###########################################
+    ##  Process the label
+    ##########################################
+    # 7. Convert label to Lower case
+    label = tf.strings.lower(label)
+    # 8. Split the label
+    label = tf.strings.unicode_split(label, input_encoding="UTF-8")
+    # 9. Map the characters in label to numbers
+    label = char_to_num(label)
+    # 10. Return a dict as our model is expecting two inputs
+    return spectrogram, label
 
 
-train_dataset = create_dataset(df_train)
-validation_dataset = create_dataset(df_val)
+def preload_data(df):
+    X, y = [], []
+    for _, row in df.iterrows():
+        file = tf.io.read_file(wavs_path + "/" + row["file_name"] + ".wav")
+        audio, _ = tf.audio.decode_wav(file)
+        spectrogram = tf.signal.stft(tf.squeeze(audio, axis=-1), frame_length, frame_step, fft_length)
+        spectrogram = tf.pow(tf.abs(spectrogram), 0.5)
+        means = tf.math.reduce_mean(spectrogram, 1, keepdims=True)
+        stddevs = tf.math.reduce_std(spectrogram, 1, keepdims=True)
+        spectrogram = (spectrogram - means) / (stddevs + 1e-10)
+
+        label = tf.strings.lower(row["normalized_transcription"])
+        label = char_to_num(tf.strings.unicode_split(label, input_encoding="UTF-8"))
+
+        X.append(spectrogram)
+        y.append(label)
+    return X, y
 
 
-def build_model(input_dim, output_dim, rnn_layers=2, rnn_units=128):
-    input_spectrogram = layers.Input((None, input_dim), name="input")
+X_train, y_train = preload_data(df_train)
+X_val, y_val = preload_data(df_val)
 
-    x = layers.Reshape((-1, input_dim, 1), name="expand_dim")(input_spectrogram)
 
-    x = layers.Conv2D(32, kernel_size=[11, 41], strides=[2, 2], padding="same", activation="relu")(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Conv2D(32, kernel_size=[11, 21], strides=[1, 2], padding="same", activation="relu")(x)
-    x = layers.BatchNormalization()(x)
+def get_generator(X, y):
+    def generator():
+        for i in range(len(X)):
+            yield X[i], y[i]
 
-    new_shape = (-1, x.shape[-2] * x.shape[-1])
-    x = layers.Reshape(new_shape)(x)
-    x = layers.Dense(rnn_units)(x)
+    return generator
 
-    for i in range(rnn_layers):
-        recurrent = layers.Bidirectional(
-            layers.LSTM(rnn_units, return_sequences=True, dropout=0.2),
-            name=f"bi_lstm_{i}"
-        )
-        x = recurrent(x)
-        x = layers.BatchNormalization()(x)
 
-    x = layers.Dense(output_dim + 1, activation="softmax", name="output")(x)
+signature = (
+    tf.TensorSpec(shape=(None, fft_length // 2 + 1), dtype=tf.float32),
+    tf.TensorSpec(shape=(None,), dtype=tf.int64)
+)
 
-    output = x
-    model = keras.Model(input_spectrogram, output, name="DeepSpeech2")
-    return model
+batch_size = 8
+
+train_dataset = tf.data.Dataset.from_generator(
+    get_generator(X_train, y_train), output_signature=signature
+).padded_batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+validation_dataset = tf.data.Dataset.from_generator(
+    get_generator(X_val, y_val), output_signature=signature
+).padded_batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+import matplotlib.pyplot as plt
+import numpy as np
+import tensorflow as tf
+from IPython import display
+
+fig = plt.figure(figsize=(8, 5))
+
+for batch in train_dataset.take(1):
+    spectrogram = batch[0][0].numpy()
+    spectrogram = np.array([np.trim_zeros(x) for x in np.transpose(spectrogram)])
+    label = batch[1][0]
+
+    # 1. Відображаємо Спектрограму
+    label = tf.strings.reduce_join(num_to_char(label)).numpy().decode("utf-8")
+    ax = plt.subplot(2, 1, 1)
+    ax.imshow(spectrogram, vmax=1)
+    ax.set_title(label)
+    ax.axis("off")
+
+    wav_file = list(df_train["file_name"])[0]
+
+    file = tf.io.read_file(wavs_path + "/" + wav_file + ".wav")
+    audio, _ = tf.audio.decode_wav(file)
+    audio = audio.numpy()
+
+    ax = plt.subplot(2, 1, 2)
+    plt.plot(audio)
+    ax.set_title("Signal Wave")
+    ax.set_xlim(0, len(audio))
+
+    display.display(display.Audio(np.transpose(audio), rate=22050))
+
+plt.show()
 
 
 def CTCLoss(y_true, y_pred):
@@ -119,23 +184,67 @@ def CTCLoss(y_true, y_pred):
     return loss
 
 
-model = build_model(input_dim=fft_length // 2 + 1, output_dim=char_to_num.vocabulary_size(), rnn_units=256)
-opt = keras.optimizers.Adam(learning_rate=1e-4)
+def build_model(input_dim, output_dim, rnn_layers=2, rnn_units=256):
+    # Вхід
+    input_spectrogram = layers.Input((None, input_dim), name="input")
+    x = layers.Reshape((-1, input_dim, 1), name="expand_dim")(input_spectrogram)
 
-model.compile(optimizer=opt, loss=CTCLoss)
+    # Conv 1
+    x = layers.Conv2D(32, [11, 41], strides=[2, 2], padding="same", use_bias=False)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
 
-history = model.fit(
-    train_dataset,
-    validation_data=validation_dataset,
-    epochs=10
+    # Conv 2
+    x = layers.Conv2D(32, [11, 21], strides=[1, 2], padding="same", use_bias=False)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+
+    # Reshape для RNN
+    x = layers.Reshape((-1, x.shape[-2] * x.shape[-1]))(x)
+
+    # RNN (GRU) - тепер тут буде лише 2 шари
+    for i in range(1, rnn_layers + 1):
+        recurrent = layers.GRU(
+            units=rnn_units,
+            activation="tanh",
+            recurrent_activation="sigmoid",
+            use_bias=True,
+            return_sequences=True,
+            reset_after=True,
+            name=f"gru_{i}",
+        )
+        x = layers.Bidirectional(recurrent, name=f"bidirectional_{i}", merge_mode="concat")(x)
+        if i < rnn_layers:
+            x = layers.Dropout(rate=0.5)(x)
+
+    # Dense
+    x = layers.Dense(units=rnn_units * 2)(x)
+    x = layers.ReLU()(x)
+    x = layers.Dropout(rate=0.5)(x)
+
+    # Вихід
+    output = layers.Dense(units=output_dim + 1, activation="softmax")(x)
+
+    model = keras.Model(input_spectrogram, output, name="DeepSpeech_2")
+    model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4), loss=CTCLoss)
+    return model
+
+
+model = build_model(
+    input_dim=fft_length // 2 + 1,
+    output_dim=char_to_num.vocabulary_size(),
+    rnn_layers=2,
+    rnn_units=256,
 )
+model.summary(line_length=110)
 
 
+# A utility function to decode the output of the network
 def decode_batch_predictions(pred):
     input_len = np.ones(pred.shape[0]) * pred.shape[1]
-
+    # Use greedy search. For complex tasks, you can use beam search
     results = keras.backend.ctc_decode(pred, input_length=input_len, greedy=True)[0][0]
-
+    # Iterate over the results and get back the text
     output_text = []
     for result in results:
         result = tf.strings.reduce_join(num_to_char(result)).numpy().decode("utf-8")
@@ -143,73 +252,69 @@ def decode_batch_predictions(pred):
     return output_text
 
 
-batch = next(iter(validation_dataset))
-X_test, y_test = batch
+# A callback class to output a few transcriptions during training
+class CallbackEval(keras.callbacks.Callback):
+    """Displays a batch of outputs after every epoch."""
 
-preds = model.predict(X_test)
-pred_texts = decode_batch_predictions(preds)
+    def __init__(self, dataset):
+        super().__init__()
+        self.dataset = dataset
 
-print("\n--- ПОРІВНЯННЯ РЕЗУЛЬТАТІВ ---\n")
+    def on_epoch_end(self, epoch: int, logs=None):
+        predictions = []
+        targets = []
+        for batch in self.dataset:
+            X, y = batch
+            batch_predictions = model.predict(X)
+            batch_predictions = decode_batch_predictions(batch_predictions)
+            predictions.extend(batch_predictions)
+            for label in y:
+                label = (
+                    tf.strings.reduce_join(num_to_char(label)).numpy().decode("utf-8")
+                )
+                targets.append(label)
+        wer_score = wer(targets, predictions)
+        print("-" * 100)
+        print(f"Word Error Rate: {wer_score:.4f}")
+        print("-" * 100)
+        for i in np.random.randint(0, len(predictions), 2):
+            print(f"Target    : {targets[i]}")
+            print(f"Prediction: {predictions[i]}")
+            print("-" * 100)
 
-for i in range(5):
-    prediction = pred_texts[i]
 
-    original = tf.strings.reduce_join(num_to_char(y_test[i])).numpy().decode("utf-8")
+# Define the number of epochs.
+epochs = 30
+# Callback function to check transcription on the val set.
+validation_callback = CallbackEval(validation_dataset)
+# Train the model
+history = model.fit(
+    train_dataset,
+    validation_data=validation_dataset,
+    epochs=epochs,
+    callbacks=[],
+    verbose=2
+)
 
-    print(f"Аудіо #{i + 1}")
-    print(f"Оригінал:   {original}")
-    print(f"Прогноз:    {prediction}")
-    print("-" * 30)
-
-from spellchecker import SpellChecker
-from jiwer import wer
 import numpy as np
 import tensorflow as tf
 
-spell = SpellChecker()
+
+def test_model_predictions(num_samples=5):
+    print(f"--- ТЕСТУВАННЯ МОДЕЛІ НА {num_samples} ПРИКЛАДАХ ---\n")
+
+    for batch in validation_dataset.take(1):
+        X, y = batch
+
+        batch_predictions = model.predict(X, verbose=0)
+
+        input_len = np.ones(batch_predictions.shape[0]) * batch_predictions.shape[1]
+        results = tf.keras.backend.ctc_decode(batch_predictions, input_length=input_len, greedy=True)[0][0]
+
+        for i in range(min(num_samples, len(X))):
+            predicted_text = tf.strings.reduce_join(num_to_char(results[i])).numpy().decode("utf-8")
+
+            target_text = tf.strings.reduce_join(num_to_char(y[i])).numpy().decode("utf-8")
 
 
-def correct_text(text):
-    if not text: return ""
-    words = text.split()
-
-    corrected_words = []
-    for word in words:
-        correction = spell.correction(word)
-        if correction:
-            corrected_words.append(correction)
-        else:
-            corrected_words.append(word)
-    return " ".join(corrected_words)
-
-
-print("Генерація прогнозів для розрахунку WER (це займе хвилину)...")
-
-original_transcriptions = []
-predicted_raw = []
-
-for batch in validation_dataset.take(5):
-    X_val, y_val = batch
-
-    preds = model.predict(X_val, verbose=0)
-    pred_texts = decode_batch_predictions(preds)
-
-    for label in y_val:
-        label = tf.strings.reduce_join(num_to_char(label)).numpy().decode("utf-8")
-        original_transcriptions.append(label)
-
-    predicted_raw.extend(pred_texts)
-
-predicted_corrected = [correct_text(txt) for txt in predicted_raw]
-
-wer_raw = wer(original_transcriptions, predicted_raw)
-wer_corrected = wer(original_transcriptions, predicted_corrected)
-
-print("-" * 30)
-print(f"WER (Сирий вихід):      {wer_raw:.4f}")
-print(f"WER (Після корекції):   {wer_corrected:.4f}")
-print("-" * 30)
-
-print(f"Оригінал:  {original_transcriptions[0]}")
-print(f"Сирий:     {predicted_raw[0]}")
-print(f"Виправлений: {predicted_corrected[0]}")
+test_model_predictions(5)
